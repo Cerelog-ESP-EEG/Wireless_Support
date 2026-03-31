@@ -22,10 +22,9 @@ Board: Navigate to Tools > Board > ESP32 Arduino and select 'ESP32 WROOM DA Modu
    
 3. To run OpenBCI GUI fork with this wifi LSL brige, follow this [Guide Link](https://github.com/Cerelog-ESP-EEG/How-to-use-OpenBCI-GUI-fork)  **but You must use the special WIFI LSL python connection script -> "Python_wifi_LSL.py" included here instead**
 
-   **Careful; this code is for the New GUI noted in Method A and Method B**
 
-**For OpenBCI forked GUI listed in Method C:
-Should you wish to use this wifi LSL bridge, you must comment out line 17 and uncomment line 18 in the Python_wifi_LSL.py script for the proper connection script.**
+**Careful; For Legacy Usage: with the old OpenBCI forked GUI listed in Method C in the link above:
+To use this wifi LSL bridge, you must comment out line 17 and uncomment line 18 in the Python_wifi_LSL.py script to have the correct scaling factor**
 
    Getting an error?: If you run the python script inside VS code on mac you need to allow local network connections in privacy settings so the code can talk to device otherwise you get a 65 error
 
