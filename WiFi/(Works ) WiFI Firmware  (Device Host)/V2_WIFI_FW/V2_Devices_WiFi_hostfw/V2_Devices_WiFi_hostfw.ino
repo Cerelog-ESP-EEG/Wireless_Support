@@ -831,8 +831,17 @@ void setup() {
   esp_log_level_set("*", ESP_LOG_NONE);
 
   // Over WiFi the USB CDC port carries status text only - the binary data
-  // protocol goes out over TCP - so it is safe to print here unconditionally.
+  // protocol goes out over TCP - so it is safe to print here.
   Serial.begin(115200);
+  // ...but only once printing cannot block. The OS enumerates this port even
+  // with no serial monitor attached, so the tx ring buffer fills and never
+  // drains. At the core's default 100 ms tx timeout (up to 20 consecutive
+  // retries) one blocked println can stall this task for ~2 s, starving the
+  // 250 Hz ADC read loop and the network flush; the stream then degrades over
+  // successive sessions and eventually stops. Status text is expendable, the
+  // data path is not - a 0 ms timeout drops the text instead of waiting.
+  // Persists across the Serial.begin(new_baud_rate) in the baud-change command.
+  Serial.setTxTimeoutMs(0);
   #ifdef DEBUG_ENABLED
       delay(5000);
   #endif
