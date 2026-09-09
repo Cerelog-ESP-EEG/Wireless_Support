@@ -29,8 +29,29 @@ Each folder has its own README with full instructions:
 Whichever transport you choose, the flow is the same:
 
 1. Flash the matching firmware with the [Arduino IDE](http://arduino.cc/en/software/).
-   Board: **Tools > Board > ESP32 Arduino > 'ESP32 WROOM DA Module'**.
-   Port: **Tools > Port**, select the COM port of your Cerelog board.
+
+   Board depends on which device you have — they are different chips, so the
+   wrong choice will not run:
+
+   | Device | `Tools > Board` |
+   | --- | --- |
+   | **V1** | **ESP32 Arduino > 'ESP32 WROOM DA Module'** |
+   | **V2** and **16 channel** | **ESP32 Arduino > 'ESP32S3 Dev Module'** |
+
+   On **V2 / 16 channel only**, also set these two. They are *not* defaults, and
+   without them the flash appears to succeed but the firmware will not run and
+   you will not be able to log data:
+
+   | Setting | Value |
+   | --- | --- |
+   | USB CDC On Boot | **Enabled** |
+   | USB Mode | **Hardware CDC and JTAG** |
+
+   Port: **Tools > Port**, select the port of your Cerelog board. A V2 enumerates
+   as a native USB device (on macOS/Linux, `/dev/cu.usbmodem*`); a V1 appears
+   through its USB-serial bridge (`/dev/cu.usbserial-*`).
+
+   See the [V2 flashing instructions](WiFi/(Works%20)%20WiFI%20Firmware%20%20(Device%20Host)/V2_WIFI_FW/readme.md) for troubleshooting.
 2. Connect to the device (join the WiFi hotspot, or just run the BLE script).
 3. Run the LSL bridge script for that transport, then follow the
    [OpenBCI GUI fork guide](https://github.com/Cerelog-ESP-EEG/How-to-use-OpenBCI-GUI-fork)

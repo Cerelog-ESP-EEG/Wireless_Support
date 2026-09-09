@@ -23,6 +23,22 @@ SD-card logging are byte-for-byte identical.
    the ESP32 Arduino core. (The build is *smaller* than the WiFi one: ~683 KB
    vs ~977 KB of flash, and ~18 KB less RAM.)
 
+   This firmware is V2-only, and the V2 is an ESP32-S3 (not the WROOM DA used by
+   V1 boards). Set these three under **Tools** before you hit Upload. The last
+   two are *not* defaults — without them the flash appears to succeed but the firmware will not
+   run and you will not be able to log data:
+
+   | Setting | Value |
+   | --- | --- |
+   | Board | **ESP32 Arduino > 'ESP32S3 Dev Module'** |
+   | USB CDC On Boot | **Enabled** |
+   | USB Mode | **Hardware CDC and JTAG** |
+
+   Port: **Tools > Port**, select the port of your Cerelog board (it enumerates
+   as a native USB device, so on macOS/Linux it is a `/dev/cu.usbmodem*`).
+
+   See the [V2 flashing instructions](../WiFi/(Works%20)%20WiFI%20Firmware%20%20(Device%20Host)/V2_WIFI_FW/readme.md) for troubleshooting.
+
 2. Install the host dependencies:
 
    ```

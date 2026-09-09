@@ -1,7 +1,8 @@
 # $\textcolor{green}{\textbf{\textsf{Additional Flashing Instructions for V2 and 16 Channel PCBs}}}$
 
 To flash firmware on the **V2** and **16 channel** boards you *must* use the **Arduino IDE**.
-The sketch to flash is [`V2_FW/V2_FW.ino`](V2_FW/V2_FW.ino).
+The sketch to flash is [`V2_Devices_WiFi_hostfw/V2_Devices_WiFi_hostfw.ino`](V2_Devices_WiFi_hostfw/V2_Devices_WiFi_hostfw.ino)
+(or, for BLE, [`V2_Devices_BLE_hostfw`](../../../Bluetooth%20Low%20Energy%20(BLE)/V2_Devices_BLE_hostfw) — the same three settings apply).
 
 ---
 
