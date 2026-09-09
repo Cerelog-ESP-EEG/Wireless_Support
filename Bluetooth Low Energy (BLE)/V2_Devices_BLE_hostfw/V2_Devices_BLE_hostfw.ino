@@ -987,6 +987,13 @@ void setup() {
   // Over BLE the USB CDC port carries status text only - the binary data
   // protocol goes out as GATT notifications - so it is safe to print here.
   Serial.begin(115200);
+  // The USB CDC port stays enumerated by the OS even when no serial monitor is
+  // draining it. With the core's default 100 ms tx timeout (and up to 20
+  // consecutive retries) a single blocked println can stall this task for ~2 s,
+  // which starves the ADC read loop and the BLE flush - the stream degrades over
+  // successive sessions and eventually stops. Status text is expendable; the
+  // data path is not. A 0 ms timeout drops the text instead of blocking.
+  Serial.setTxTimeoutMs(0);
   #ifdef DEBUG_ENABLED
       delay(5000);
   #endif
