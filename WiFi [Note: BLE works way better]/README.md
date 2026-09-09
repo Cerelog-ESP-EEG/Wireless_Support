@@ -37,7 +37,7 @@ The device brings up its own WiFi access point; your computer joins it and
    as a native USB device (on macOS/Linux, `/dev/cu.usbmodem*`); a V1 appears
    through its USB-serial bridge (`/dev/cu.usbserial-*`).
 
-   See the [V2 flashing instructions]((Works%20)%20WiFI%20Firmware%20%20(Device%20Host)/V2_WIFI_FW/readme.md)
+   See the [V2 flashing instructions](<(Works ) WiFI Firmware  (Device Host)/V2_WIFI_FW/readme.md>)
    for troubleshooting.
 
 2. Connect your computer to the WiFi hotspot the device creates. It shows up as

@@ -121,6 +121,17 @@ async def main():
     async with BleakClient(device, timeout=20.0, disconnected_callback=link.on_disconnect) as client:
         print(">>> CONNECTED <<<")
 
+        # On BlueZ (Linux) mtu_size is only populated by _acquire_mtu(); without
+        # this it warns and reports 23, which makes the firmware split every
+        # 37-byte packet across two notifications (~500/s) and drop samples.
+        # macOS and Windows report the real MTU directly and have no such
+        # method, so the hasattr guard makes this a no-op there.
+        if hasattr(client, "_acquire_mtu"):
+            try:
+                await client._acquire_mtu()
+            except Exception:
+                pass
+
         try:
             mtu = int(client.mtu_size)
         except Exception:
