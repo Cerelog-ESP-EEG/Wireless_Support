@@ -8,15 +8,21 @@ connects to it directly (no network to join, no IP address), and
 The V2 firmware is a copy of `V2_Devices_WiFi_hostfw` with only the connection
 logic changed. The ADS1299 setup, register map, packet format, timestamping and
 SD-card logging are byte-for-byte identical. The V1 firmware is the same idea
-applied to the V1 USB firmware's ADS1299 layer.
+applied to the V1 USB firmware's ADS1299 layer, and the 16-channel firmware the
+same idea applied to `16CH_EMUL_FW`'s dual-ADS1299 layer.
+
+One host script covers all three boards. It tells them apart by the advertised
+BLE name and sizes its LSL stream accordingly — 8 channels for V1/V2,
+16 channels for the 16-channel board.
 
 ## Contents
 
 | File | What it is |
 | --- | --- |
-| `BLE Firmware/V2_Devices_BLE_hostfw/` | V2 / 16-channel firmware (ESP32-S3) |
-| `BLE Firmware/V1_Devices_BLE_hostfw/` | V1 firmware (classic ESP32) |
-| `Python_ble_LSL.py` | Host script: BLE -> LSL bridge, works with either |
+| `BLE Firmware/V2_Devices_BLE_hostfw/` | V2 firmware, 8 channels (ESP32-S3) |
+| `BLE Firmware/V1_Devices_BLE_hostfw/` | V1 firmware, 8 channels (classic ESP32) |
+| `BLE Firmware/16CH_Devices_BLE_hostfw/` | 16-channel firmware (ESP32-S3) |
+| `Python_ble_LSL.py` | Host script: BLE -> LSL bridge, works with all three |
 
 ## Instructions
 
@@ -25,12 +31,19 @@ applied to the V1 USB firmware's ADS1299 layer.
    the ESP32 Arduino core. (The build is *smaller* than the WiFi one: ~683 KB
    vs ~977 KB of flash, and ~18 KB less RAM.)
 
-   Pick the sketch that matches your board - they are different chips. For
-   **V1**, flash `BLE Firmware/V1_Devices_BLE_hostfw` and select
-   **'ESP32 WROOM DA Module'**; the CH340 bridge on V1 is unreliable at the
-   default upload speed, so also set **Tools > Upload Speed > 115200**. The
-   settings below are for **V2 / 16 channel** (an ESP32-S3). The last
-   two are *not* defaults — without them the flash appears to succeed but the firmware will not
+   Pick the sketch that matches your board. For **V1**, flash
+   `BLE Firmware/V1_Devices_BLE_hostfw` and select
+   **'ESP32 WROOM DA Module'** - V1 is a different chip; the CH340 bridge on it
+   is unreliable at the default upload speed, so also set
+   **Tools > Upload Speed > 115200**. For the **16-channel** board flash
+   `BLE Firmware/16CH_Devices_BLE_hostfw`, which takes exactly the same settings
+   as V2 below (both are ESP32-S3). Note that these are *not* the settings the
+   16-channel **USB** firmware needs: `16CH_EMUL_FW` requires USB-OTG (TinyUSB)
+   with CDC-on-boot disabled so the OpenBCI GUI sees a "VCP" port, and the BLE
+   sketch deliberately does not - it has no serial port to impersonate. If you
+   are switching a 16-channel board from USB to BLE, change those two settings
+   back. The settings below are for **V2 and 16 channel** (both ESP32-S3). The
+   last two are *not* defaults — without them the flash appears to succeed but the firmware will not
    run and you will not be able to log data:
 
    | Setting | Value |
@@ -70,11 +83,11 @@ script.
 
 | WiFi | BLE |
 | --- | --- |
-| SoftAP `CERELOG_EEG` / `cerelog123` | BLE peripheral advertising as `CERELOG_EEG` |
+| SoftAP `CERELOG_EEG` / `cerelog123` | BLE peripheral advertising as `CERELOG_EEG` (`CERELOG_EEG_16` on the 16-channel board) |
 | UDP 4445 `CERELOG_FIND_ME` discovery | BLE scan for the device name / service UUID |
 | TCP socket on port 1112 | GATT notify characteristic |
 | Stream starts on TCP connect | Stream starts when the host writes `CMD_START` |
-| One 37-byte `client.write()` per sample | Up to 13 packets coalesced into one notification |
+| One 37-byte `client.write()` per sample | Up to 13 packets coalesced into one notification (8 of the 61-byte 16-channel packets) |
 
 GATT UUIDs (they must match on both sides):
 
@@ -84,14 +97,40 @@ Data     7a1e8b01-9c3d-4b7e-8f21-6d0a5c2e91f3   notify
 Control  7a1e8b02-9c3d-4b7e-8f21-6d0a5c2e91f3   write
 ```
 
+All three boards use the **same** UUIDs, so one scan filter finds any of them;
+only the advertised name differs. That name is what tells the host how wide the
+packets are, because the LSL outlet has to be sized before the first sample
+arrives. If a board is ever matched by service UUID with no name available, the
+script falls back to reading the width out of the first packet's length field.
+
 The control write is `[0x01, mtu_hi, mtu_lo]` to start and `[0x00]` to stop.
 The host sends the ATT MTU it negotiated so the firmware never stages a
 notification the link would truncate.
 
+### Packet format
+
+Identical framing on every board - only the channel count differs:
+
+```
+ [0:2]   0xABCD                     start marker
+ [2]     message length             31 (8 ch) or 55 (16 ch)
+ [3:7]   uint32 big-endian          device clock, ms
+ [7:10]  ADS1299 status word
+ [10:..] N x 24-bit big-endian      8 or 16 channels
+ [..]    checksum                   sum(bytes 2..checksum-1) & 0xFF
+ [..:..] 0xDCBA                     end marker
+```
+
+Total 37 bytes for 8 channels, 61 for 16. On the 16-channel board channels 1-8
+come from ADC1 and 9-16 from ADC2; the status word on the wire is ADC1's, and
+each device's own status word is written to the SD log.
+
 ## Packet dropping
 
-BLE has far less headroom than TCP: 250 Hz x 37 bytes is ~9.3 kB/s, which is
-comfortable on a healthy link but not guaranteed on a busy 2.4 GHz band. The
+BLE has far less headroom than TCP: 250 Hz x 37 bytes is ~9.3 kB/s for an
+8-channel board, and 250 Hz x 61 bytes is ~15.3 kB/s for the 16-channel one.
+Both are comfortable on a healthy link but neither is guaranteed on a busy
+2.4 GHz band. The
 firmware is built to **drop rather than stall** — a backed-up radio must never
 hold up the ADC read loop or push the stream further and further behind
 real time.
@@ -109,9 +148,25 @@ Three things are counted and printed over USB serial every 5 seconds:
   the ADS1299 overwrote it. Non-zero here means the loop is being starved.
 * `sd_dropped` — the pre-existing SD-card queue counter, unchanged.
 
-Staging is bounded at 13 packets (481 bytes, one full notification), and
-`stop_acquisition()` discards whatever is still staged, so a reconnect always
+Staging is bounded at one full notification - 13 packets / 481 bytes on the
+8-channel boards, 8 packets / 488 bytes on the 16-channel one - and
+stopping the stream discards whatever is still staged, so a reconnect always
 starts clean rather than replaying stale samples.
+
+## SD-card logging while idle
+
+One real behavioural difference between the boards. On **V1 and V2** the
+ADS1299 is held idle (START low) until the host writes `CMD_START`, so the SD
+card records only while you are streaming — that gating is what keeps the
+wireless stream clean on those boards.
+
+The **16-channel** firmware instead leaves both ADS1299s free-running from boot,
+exactly as its USB firmware does, so **the SD card records whenever the board is
+powered**, connected or not. `CMD_START` / `CMD_STOP` open and close the BLE
+transmit path only. Two reasons: logging-whenever-powered is a feature of that
+board, and its START sequence is a single shared hardware edge that also keeps
+ADC2 (which runs on ADC1's clock) in step, so re-running it per session would be
+risk with no benefit.
 
 The host script counts independently, using the 4-byte device timestamp in
 every packet to spot gaps:
@@ -127,7 +182,8 @@ steadily, move closer to the device or cut 2.4 GHz interference; if it stays at
 
 ## Timestamps
 
-Because packets arrive in batches of up to 13, stamping them with arrival time
+Because packets arrive in batches (up to 13 on an 8-channel board, 8 on the
+16-channel one), stamping them with arrival time
 would bunch samples into ~50 ms lumps. The host script instead maps the
 device's own sample clock (the ms field in each packet) onto the LSL clock, so
 LSL sees an evenly spaced 250 Hz stream. Set `USE_DEVICE_TIMESTAMPS = False` at
