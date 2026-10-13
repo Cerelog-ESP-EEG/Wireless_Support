@@ -13,7 +13,10 @@ same idea applied to `16CH_EMUL_FW`'s dual-ADS1299 layer.
 
 One host script covers all three boards. It tells them apart by the advertised
 BLE name and sizes its LSL stream accordingly — 8 channels for V1/V2,
-16 channels for the 16-channel board.
+16 channels for the 16-channel board. For a 16-channel board it additionally
+publishes the stream as an OpenBCI Cyton+Daisy WiFi shield, so the **stock
+OpenBCI GUI can connect natively** alongside the LSL output — see
+[Native OpenBCI GUI connection](#native-openbci-gui-connection-16-channel-board-only).
 
 ## Contents
 
@@ -74,6 +77,11 @@ BLE name and sizes its LSL stream accordingly — 8 channels for V1/V2,
 4. Follow the
    [OpenBCI GUI fork guide](https://github.com/Cerelog-ESP-EEG/How-to-use-OpenBCI-GUI-fork)
    from there, using this script as the LSL bridge.
+
+   On a **16-channel** board you can skip the fork entirely and connect the
+   stock GUI natively instead — run the script with `sudo` and see
+   [Native OpenBCI GUI connection](#native-openbci-gui-connection-16-channel-board-only).
+   Both outputs are live at the same time, so you can use either or both.
 
 **Legacy usage:** with the old OpenBCI forked GUI, swap the
 `GUI_CORRECTION_FACTOR` line for the commented-out one, same as in the WiFi
@@ -152,6 +160,120 @@ Staging is bounded at one full notification - 13 packets / 481 bytes on the
 8-channel boards, 8 packets / 488 bytes on the 16-channel one - and
 stopping the stream discards whatever is still staged, so a reconnect always
 starts clean rather than replaying stale samples.
+
+## Native OpenBCI GUI connection (16-channel board only)
+
+On top of the LSL outlet, a 16-channel board is also published as an **OpenBCI
+Cyton+Daisy WiFi shield**, which the stock GUI connects to natively — no fork,
+no LSL bridge. Both outputs run at once from the one script; the LSL stream is
+unchanged and is still the primary output.
+
+```
+sudo -E python3 Python_ble_LSL.py
+```
+
+Then in the GUI: **CYTON (LIVE) → WIFI → STATIC IP**, enter `127.0.0.1`, set
+**CHANNEL COUNT** to **16** and **SAMPLE RATE** to **250**, and start the
+session. The script prints the address to use (and your LAN address, if you want
+to run the GUI on another machine).
+
+The sample rate is not optional. The GUI plots, filters and FFTs against
+whatever rate you pick, so picking 500 or 1000 stretches the time axis by 2x or
+4x. The script watches for it and says so:
+
+```
+[GUI] *** WARNING: the GUI is set to 1000 Hz but this board streams 250 Hz. ***
+```
+
+### Why it needs sudo
+
+BrainFlow builds its URLs as `"http://" + <the IP you typed> + "/board"` with no
+port, and validates that string with `inet_pton` — so it must be a bare IPv4
+address, and the HTTP port is unavoidably **80**. Ports below 1024 need root.
+If the bind fails the script says so and carries on with LSL alone:
+
+```
+OpenBCI GUI emulation DISABLED: no permission to bind port 80.
+```
+
+If `sudo` breaks Bluetooth on your machine (macOS grants Bluetooth access per
+app, and root has its own permission store), you still have the LSL path, which
+needs no privileges.
+
+### Why not a virtual serial port, like the USB firmware
+
+The USB firmware (`16CH_EMUL_FW`) got itself into the GUI's port list by being a
+real USB CDC device whose product string started with `VCP` — the GUI calls
+jSerialComm's `getCommPorts()` and keeps only ports whose name starts with
+`"FT231X USB UART"` or `"VCP"`. A script cannot reproduce that:
+
+* the only serial endpoint a user-space process can create is a pty;
+* jSerialComm enumerates macOS serial ports out of the IOKit registry, and a
+  pty never appears there (`ioreg -c IOSerialBSDClient` lists only real ports);
+* the GUI additionally drops every `tty*` name on macOS, which is what a pty is;
+* `VCP` comes from a USB descriptor, which a pty does not have;
+* devfs does not accept symlinks, so the name cannot be faked either.
+
+A virtual serial port on macOS needs a kernel driver. The WiFi shield is the
+GUI's other native 16-channel path, it is pure HTTP + TCP, and it carries the
+**same 33-byte packets** — so the firmware's EMUL wire format came across
+unchanged and only the transport differs.
+
+### The protocol
+
+BrainFlow drives five endpoints, in this order, and the data connection is
+outbound — BrainFlow binds a server socket and waits for the shield to dial in:
+
+| Request | What the script does |
+| --- | --- |
+| `GET /board` | reports a connected 16-channel board |
+| `POST /tcp` | `{"ip","port"}` → opens a TCP connection **back** to that address |
+| `POST /command` | acknowledges `~4`, `d`, `~6`, `x..X`, … and changes nothing |
+| `GET /stream/start` | begins pushing packets |
+| `GET /stream/stop` | stops |
+
+Packets are the Cyton format the USB firmware already built:
+
+```
+ [0]      0xA0                      start byte
+ [1]      counter                   SAME in both halves of a 16-ch sample
+ [2:26]   8 x 24-bit big-endian     ch1-8 first packet, ch9-16 second
+ [26:32]  6 aux bytes               zero, no accelerometer fitted
+ [32]     0xC0                      standard stop byte
+```
+
+Two things differ from the USB firmware's serial output, both because
+BrainFlow's `cyton_daisy_wifi` reader requires it rather than by choice:
+
+* **Pairing.** The serial EMUL reader splits a 16-channel sample by the *parity*
+  of the counter (even = ch9-16 first). The WiFi reader pairs two packets
+  carrying the *same* counter, channels 1-8 first, and commits on the second.
+* **Rate.** The serial path had to average two conversions down to 125 Hz,
+  because BrainFlow fixes that rate for the 16-channel serial board. The WiFi
+  board's rate is whatever the GUI is told, so **250 Hz goes out untouched** —
+  the downsampling is gone.
+
+### Amplitudes differ from the LSL stream, on purpose
+
+The wire carries **raw ADS1299 counts**. BrainFlow applies
+`4.5 V / (2^23-1) / gain`, and its 16-channel gain tracker defaults to gain 24
+on every channel — exactly this hardware — so the GUI shows true microvolts
+with the script scaling nothing. That is the physically correct figure and it is
+**not** the same as the LSL stream, which carries the fork-specific
+`GUI_CORRECTION_FACTOR` (1.128x) and a DC blocker. The GUI does its own
+filtering, so no DC blocker is applied on this path.
+
+### Hardware settings are ignored, as they were over USB
+
+The GUI's Hardware Settings panel can push per-channel commands. They are
+acknowledged so the GUI stays happy, and **not one ADS1299 register is
+written** — the same lock the USB firmware had via
+`OBCI_ALLOW_GUI_HARDWARE_SETTINGS = 0`. Gain, montage and the bias policy are
+fixed by the BLE firmware's register tables. Each command is logged so you can
+see it arrive.
+
+To turn the whole thing off, set `OPENBCI_EMULATION = False` near the top of the
+script.
 
 ## SD-card logging while idle
 
