@@ -79,7 +79,7 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
    from there, using this script as the LSL bridge.
 
    On a **16-channel** board you can skip the fork entirely and connect the
-   stock GUI natively instead — run the script with `sudo` and see
+   stock GUI (or a BrainFlow script) natively instead — see
    [Native OpenBCI GUI connection](#native-openbci-gui-connection-16-channel-board-only).
    Both outputs are live at the same time, so you can use either or both.
 
@@ -169,7 +169,7 @@ no LSL bridge. Both outputs run at once from the one script; the LSL stream is
 unchanged and is still the primary output.
 
 ```
-sudo -E python3 Python_ble_LSL.py
+python3 Python_ble_LSL.py
 ```
 
 Then in the GUI: **CYTON (LIVE) → WIFI → STATIC IP**, enter `127.0.0.1`, set
@@ -185,20 +185,37 @@ whatever rate you pick, so picking 500 or 1000 stretches the time axis by 2x or
 [GUI] *** WARNING: the GUI is set to 1000 Hz but this board streams 250 Hz. ***
 ```
 
-### Why it needs sudo
+### Port 80, and whether you need sudo
 
 BrainFlow builds its URLs as `"http://" + <the IP you typed> + "/board"` with no
 port, and validates that string with `inet_pton` — so it must be a bare IPv4
-address, and the HTTP port is unavoidably **80**. Ports below 1024 need root.
-If the bind fails the script says so and carries on with LSL alone:
+address, and the HTTP port is unavoidably **80**.
+
+**On macOS this works without sudo** — verified by binding `0.0.0.0:80` as a
+normal user and serving a real request through it. Just run the script normally.
+
+If your OS does reserve ports below 1024 (Linux generally does), the bind fails
+and the script says so, then carries on with LSL alone:
 
 ```
 OpenBCI GUI emulation DISABLED: no permission to bind port 80.
 ```
 
-If `sudo` breaks Bluetooth on your machine (macOS grants Bluetooth access per
-app, and root has its own permission store), you still have the LSL path, which
-needs no privileges.
+Three ways out, cheapest first:
+
+* **Linux, one-time:** `sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80`
+  (add it to `/etc/sysctl.conf` to persist). No per-run sudo.
+* **Linux, per-binary:** `sudo setcap cap_net_bind_service=+ep $(readlink -f $(which python3))`.
+* **Last resort, any OS:** run the script under `sudo`. Use **`sudo -E`**, not
+  plain `sudo` — `bleak` and `pylsl` are usually `pip install --user` packages
+  that Python locates through `$HOME`, and plain `sudo` resets `$HOME` to
+  root's, so you get a confusing `ModuleNotFoundError: No module named 'bleak'`
+  that looks like a missing dependency but is not. Be aware that running as
+  root can also break Bluetooth on macOS, which grants Bluetooth access per
+  app and gives root its own permission store.
+
+The LSL path never needs any of this, and neither do V1/V2 boards — they have no
+emulation and never touch port 80.
 
 ### Why not a virtual serial port, like the USB firmware
 
@@ -252,6 +269,92 @@ BrainFlow's `cyton_daisy_wifi` reader requires it rather than by choice:
   because BrainFlow fixes that rate for the 16-channel serial board. The WiFi
   board's rate is whatever the GUI is told, so **250 Hz goes out untouched** —
   the downsampling is gone.
+
+### Connecting with BrainFlow instead of the GUI
+
+Nothing extra to configure — the GUI reaches the board *through* BrainFlow, so a
+BrainFlow script is the same client with the same two parameters.
+
+How a real WiFi shield is normally used:
+
+```python
+params = BrainFlowInputParams()
+params.ip_address = "192.168.4.1"   # the shield itself (AP mode; or its DHCP address)
+params.ip_port    = 6677
+board = BoardShim(BoardIds.CYTON_DAISY_WIFI_BOARD, params)
+```
+
+Point `ip_address` at wherever this script is running instead, and everything
+else is identical:
+
+```python
+import time
+from brainflow.board_shim import BoardShim, BoardIds, BrainFlowInputParams
+from brainflow.data_filter import DataFilter, FilterTypes
+
+SAMPLING_RATE = 250          # the real rate - see the trap below
+
+params = BrainFlowInputParams()
+params.ip_address = "127.0.0.1"    # must be a bare IPv4; HTTP always goes to :80
+params.ip_port    = 6677           # a LOCAL port BrainFlow listens on, see below
+# params.timeout  = 10             # optional, HTTP timeout in seconds
+
+board = BoardShim(BoardIds.CYTON_DAISY_WIFI_BOARD, params)   # board id 6
+board.prepare_session()
+board.config_board("~6")           # tell it 250 Hz
+board.start_stream()
+
+time.sleep(10)
+data = board.get_board_data()
+
+board.stop_stream()
+board.release_session()
+
+eeg = BoardShim.get_eeg_channels(BoardIds.CYTON_DAISY_WIFI_BOARD)   # 16 rows
+for row in eeg:
+    DataFilter.perform_bandpass(data[row], SAMPLING_RATE, 1.0, 50.0, 4,
+                                FilterTypes.BUTTERWORTH.value, 0)
+```
+
+`ip_port` is **not** a port on the board. BrainFlow binds its own TCP *server*
+on that local port and `POST /tcp` tells the shield to dial back into it — which
+is why the data connection is outbound in the table above. 6677 is the
+conventional value; it is what the GUI hardcodes.
+
+Row layout for board id 6, straight from BrainFlow's board table — use the
+accessors rather than hardcoding:
+
+| Rows | Contents |
+| --- | --- |
+| 0 | package counter, +1 per 16-channel sample, wraps at 256 |
+| 1–16 | EEG in µV; **1–8 from ADC1, 9–16 from ADC2** |
+| 17–19 | accelerometer — always 0, none fitted |
+| 20–26, 27–29 | other / analog, unused |
+| 30 | timestamp (real wall clock) |
+| 31 | marker |
+
+#### The one trap: get_sampling_rate() lies
+
+```python
+BoardShim.get_sampling_rate(BoardIds.CYTON_DAISY_WIFI_BOARD)   # -> 1000
+```
+
+That 1000 is static metadata for a real shield, and **this board streams 250 Hz**.
+The GUI gets away with it because it overrides the value with whatever you chose
+in the UI; a raw BrainFlow script does not. So:
+
+* pass a literal `250` to every `DataFilter` call, never `get_sampling_rate()`;
+* expect ~2500 samples from 10 seconds, not 10000;
+* row 30 timestamps are real wall-clock, so they are correct either way — use
+  them if you need true timing.
+
+#### One consumer at a time
+
+The GUI and a BrainFlow script both arrive as a `POST /tcp`, and the second one
+replaces the first — so you can drive either, but not both at once. Handing over
+needs no restart of this script: quit the GUI session, run your BrainFlow
+script, and it takes over cleanly. The **LSL outlet is always live in parallel**
+regardless, so that is the way to feed two consumers at the same time.
 
 ### Amplitudes differ from the LSL stream, on purpose
 

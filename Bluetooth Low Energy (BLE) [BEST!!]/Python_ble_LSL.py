@@ -210,8 +210,12 @@ class ObciWifiShieldEmulator:
                 self._serve_http, host=OPENBCI_HTTP_HOST, port=OPENBCI_HTTP_PORT)
         except PermissionError:
             print(f"OpenBCI GUI emulation DISABLED: no permission to bind port {OPENBCI_HTTP_PORT}.")
-            print("  BrainFlow always talks to a WiFi shield on port 80, and ports below 1024")
-            print("  need root. Re-run with 'sudo -E python3 Python_ble_LSL.py' to enable it.")
+            print("  BrainFlow always talks to a WiFi shield on port 80, and this OS reserves")
+            print("  ports below 1024. Either of these enables it:")
+            print("    Linux, once:  sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80")
+            print("    any OS:       sudo -E python3 Python_ble_LSL.py")
+            print("  Use sudo -E, not plain sudo: bleak/pylsl are often --user installs that")
+            print("  Python finds via $HOME, which plain sudo resets.")
             print("  The LSL stream below is unaffected.")
             return False
         except OSError as e:
@@ -243,13 +247,6 @@ class ObciWifiShieldEmulator:
 
     async def close(self):
         self.streaming = False
-        if self._writer_task is not None:
-            self._writer_task.cancel()
-            try:
-                await self._writer_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._writer_task = None
         await self._close_data_connection()
         if self.http_server is not None:
             self.http_server.close()
@@ -393,12 +390,36 @@ class ObciWifiShieldEmulator:
 
         self.data_writer = writer
         self.client_addr = f"{ip}:{port}"
+        # A new data connection means a new prepare_session, which always
+        # re-sends "~4" then "d". Forget the previous session's "d" or that
+        # mandatory "~4" would be mistaken for a deliberate 1000 Hz choice and
+        # trigger a false rate warning - which is exactly what happens when a
+        # GUI session is restarted or handed over to a BrainFlow script.
+        self.seen_defaults_command = False
         self._wake.clear()
         self._writer_task = asyncio.create_task(self._writer_loop(writer))
         print(f"[GUI] data connection open to {self.client_addr}")
         return json.dumps({"connected": True, "ip": ip, "port": port}).encode()
 
     async def _close_data_connection(self):
+        """Tear down the data connection AND its writer task.
+
+        The task has to be cancelled, not just left to notice the closed
+        socket. Between batches it parks on self._wake, so a stale task would
+        sleep straight through the close, wake on the NEXT session's first
+        sample, take that batch out of the shared buffer, fail to write it to
+        the dead socket, and switch streaming off underneath the new
+        connection. Restarting a GUI session - or handing over from the GUI to
+        a BrainFlow script without restarting this bridge - is exactly that
+        path, since both arrive as a second POST /tcp.
+        """
+        task, self._writer_task = self._writer_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
         writer, self.data_writer = self.data_writer, None
         if writer is not None:
             try:
@@ -467,9 +488,11 @@ class ObciWifiShieldEmulator:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[GUI] data connection lost: {e}")
-            self.streaming = False
+            # Guard against a superseded writer reporting the failure of a
+            # connection that has already been replaced.
             if self.data_writer is writer:
+                print(f"[GUI] data connection lost: {e}")
+                self.streaming = False
                 self.data_writer = None
 
     def status(self):
