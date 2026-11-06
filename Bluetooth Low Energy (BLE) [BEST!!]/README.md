@@ -56,6 +56,10 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
    | USB CDC On Boot | **Enabled** |
    | USB Mode | **Hardware CDC and JTAG** |
 
+   For **V2**, the buffered firmware was tested on **esp32 by Espressif Systems
+   3.2.0** (Tools > Board > Boards Manager) with the default Flash Size and
+   Partition Scheme.
+
    For the **16-channel** board, also match the build that was tested with the
    buffered firmware:
 
@@ -182,14 +186,16 @@ Staging is bounded at one full notification - 13 packets / 481 bytes on the
 stopping the stream discards whatever is still staged, so a reconnect always
 starts clean rather than replaying stale samples.
 
-### 16-channel board: buffered instead of dropped
+### V2 and 16-channel boards: buffered instead of dropped
 
-Everything above describes V1 and V2. The 16-channel firmware holds on to refused
+Everything above describes V1. The V2 and 16-channel firmware hold on to refused
 samples, because a Bluetooth mouse on the same adapter as the board takes airtime
-from this link for as long as it is moving, and dropping cost about 28% of samples.
+from this link for as long as it is moving, and on the 16-channel board dropping
+cost about 28% of samples.
 
 * A refused notification is retried instead of discarded, and new samples wait in
-  a ring of `BLE_RING_PACKETS` (2048 packets, about 8 s, about 122 KB of RAM).
+  a ring of `BLE_RING_PACKETS` (2048 packets, about 8 s; about 74 KB of RAM on V2,
+  about 122 KB on the 16-channel board).
 * If the ring fills, the oldest sample is dropped and counted in `ble_dropped`, so
   latency stays bounded at about 8 s.
 * Samples are stamped when they are read from the ADC, so a delayed sample still
@@ -198,7 +204,8 @@ from this link for as long as it is moving, and dropping cost about 28% of sampl
   packets, which cut the airtime each notification needs. Both are requests the
   host can refuse.
 
-Its serial output differs from the V1/V2 line shown above:
+Their serial output differs from the V1 line shown above (on a Bluedroid build the
+`[LINK]` line ends in `data_len tx/rx=` instead):
 
 ```
 [STATS] sent=1246 ble_dropped=0 (retries=0) adc_overrun=0 sd_dropped=0 backlog=3 peak=7 free_heap=109356

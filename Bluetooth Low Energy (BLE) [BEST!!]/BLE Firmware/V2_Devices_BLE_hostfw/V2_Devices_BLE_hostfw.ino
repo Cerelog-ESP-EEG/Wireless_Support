@@ -29,6 +29,14 @@ const uint8_t  BLE_MAX_PACKETS_PER_NOTIFY = 13;
 const uint16_t BLE_NOTIFY_FLUSH_MS = 25;   // bound on staging latency
 const uint32_t BLE_STATS_PERIOD_MS = 5000; // how often drop counters are printed
 
+// A refused notification is held and retried, not thrown away. The host's radio
+// is shared: a Bluetooth mouse on the same adapter takes connection events away
+// from this link for as long as it is moving, and the stack refuses notifies
+// while its queue is full. BLE_RING_PACKETS is how much backlog that can leave
+// before samples are lost: 2048 x 4 ms = ~8 s, ~74 KB of RAM.
+const uint16_t BLE_RING_PACKETS = 2048;
+const uint32_t BLE_RETRY_US     = 1000;    // pause after a refused notify
+
 BLEServer         *bleServer = NULL;
 BLECharacteristic *dataChar  = NULL;
 BLECharacteristic *ctrlChar  = NULL;
@@ -39,11 +47,11 @@ volatile uint16_t ble_host_mtu = 23;            // ATT MTU as reported by the ho
 bool              ble_was_connected = false;
 
 // --- Drop accounting -------------------------------------------------------
-// The BLE link can refuse packets when the controller's buffers back up. When
-// that happens the staged batch is thrown away rather than queued, so the
-// stream always stays live instead of drifting further and further behind.
-volatile uint32_t ble_dropped_samples  = 0;   // samples lost to a failed notify
-volatile uint32_t ble_dropped_notifies = 0;   // notifications the stack refused
+// The BLE link can refuse packets when the controller's buffers back up. The
+// refused batch is retried and new samples wait in the ring. Only when the ring
+// itself is full is the oldest sample discarded, which bounds the latency.
+volatile uint32_t ble_dropped_samples  = 0;   // samples lost to a full ring
+volatile uint32_t ble_notify_retries   = 0;   // notifies refused, then retried
 volatile uint32_t adc_overrun_count    = 0;   // DRDY fired before loop() read the last sample
 uint32_t          ble_sent_samples     = 0;
 unsigned long     ble_stats_ms         = 0;   // last time counters were printed
@@ -57,6 +65,57 @@ volatile bool streaming_allowed = false;
 void start_acquisition(void);
 void stop_acquisition(void);
 
+// --- Link tuning -----------------------------------------------------------
+// Airtime is what a busy host radio runs short of, so ask for the 2M PHY and
+// 251-byte link-layer packets: the same notification then needs far less of it.
+// Both are requests the central may refuse; the outcome is printed as [LINK].
+// The ESP32 core ships Bluedroid or NimBLE depending on its version, and they
+// expose this differently, so each has its own branch below.
+volatile bool     ble_peer_known   = false;
+volatile bool     ble_link_changed = false;
+volatile uint16_t link_interval    = 0;   // units of 1.25 ms
+volatile uint16_t link_latency     = 0;
+volatile uint16_t link_timeout     = 0;   // units of 10 ms
+volatile uint8_t  link_tx_phy      = 0;   // 1 = 1M, 2 = 2M, 3 = coded
+volatile uint8_t  link_rx_phy      = 0;
+volatile uint16_t link_tx_octets   = 0;
+volatile uint16_t link_rx_octets   = 0;
+
+#if defined(CONFIG_BLUEDROID_ENABLED)
+esp_bd_addr_t     ble_peer_bda;
+
+static void ble_gap_observer(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+  switch (event) {
+    case ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT:
+      link_interval = param->update_conn_params.conn_int;
+      link_latency  = param->update_conn_params.latency;
+      link_timeout  = param->update_conn_params.timeout;
+      ble_link_changed = true;
+      break;
+    case ESP_GAP_BLE_PHY_UPDATE_COMPLETE_EVT:
+      link_tx_phy = param->phy_update.tx_phy;
+      link_rx_phy = param->phy_update.rx_phy;
+      ble_link_changed = true;
+      break;
+    case ESP_GAP_BLE_READ_PHY_COMPLETE_EVT:
+      link_tx_phy = param->read_phy.tx_phy;
+      link_rx_phy = param->read_phy.rx_phy;
+      ble_link_changed = true;
+      break;
+    case ESP_GAP_BLE_SET_PKT_LENGTH_COMPLETE_EVT:
+      link_tx_octets = param->pkt_data_length_cmpl.params.tx_len;
+      link_rx_octets = param->pkt_data_length_cmpl.params.rx_len;
+      ble_link_changed = true;
+      break;
+    default:
+      break;
+  }
+}
+#elif defined(CONFIG_NIMBLE_ENABLED)
+volatile uint16_t ble_peer_handle = 0;
+int               link_data_len_rc = 0;   // 0 = the 251-byte request was sent
+#endif
+
 // --- BLE callbacks ---------------------------------------------------------
 class CerelogServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) {
@@ -65,6 +124,7 @@ class CerelogServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *pServer) {
       bleConnected = false;
       hostRequestedStream = false;
+      ble_peer_known = false;
   }
   // The ESP32 core ships the BLE library on either Bluedroid or NimBLE, and the
   // two spell the connection handle differently. Both call the plain onConnect
@@ -74,11 +134,15 @@ class CerelogServerCallbacks : public BLEServerCallbacks {
 #if defined(CONFIG_BLUEDROID_ENABLED)
   void onConnect(BLEServer *pServer, esp_ble_gatts_cb_param_t *param) {
       bleConnected = true;
+      memcpy(ble_peer_bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+      ble_peer_known = true;
       pServer->updateConnParams(param->connect.remote_bda, 6, 12, 0, 200);
   }
 #elif defined(CONFIG_NIMBLE_ENABLED)
   void onConnect(BLEServer *pServer, ble_gap_conn_desc *desc) {
       bleConnected = true;
+      ble_peer_handle = desc->conn_handle;
+      ble_peer_known = true;
       pServer->updateConnParams(desc->conn_handle, 6, 12, 0, 200);
   }
 #endif
@@ -103,7 +167,7 @@ class CerelogCtrlCallbacks : public BLECharacteristicCallbacks {
 };
 
 // Fires for every notify(). Anything other than SUCCESS_NOTIFY means the
-// stack would not take the packet, i.e. those samples are gone.
+// stack would not take the packet, so ble_service() sends it again.
 class CerelogDataCallbacks : public BLECharacteristicCallbacks {
   void onStatus(BLECharacteristic *pChar, Status s, uint32_t code) {
       if (s != BLECharacteristicCallbacks::SUCCESS_NOTIFY) ble_notify_failed = true;
@@ -186,11 +250,21 @@ const uint8_t PACKET_IDX_CHECKSUM = PACKET_IDX_ADS1299_DATA + ADS1299_TOTAL_DATA
 const uint8_t PACKET_IDX_END_MARKER = PACKET_IDX_CHECKSUM + PACKET_CHECKSUM_BYTES;
 
 // --- BLE notification staging ---
-// Whole packets are collected here and pushed out as one notification. The
-// buffer is deliberately small: if the link cannot drain it, the batch is
-// dropped (and counted) so what does get through is always fresh.
+// Samples wait in the ring until the link can take them. ble_tx_buf holds the
+// one batch being sent, which stays there until the stack has accepted all of
+// it, so a discarded sample can never split a packet already partly sent.
+// Everything here is touched from loop() only.
+static uint8_t ble_ring[(uint32_t)BLE_RING_PACKETS * PACKET_TOTAL_SIZE];
+uint16_t ble_ring_head = 0;         // next packet to write
+uint16_t ble_ring_tail = 0;         // oldest packet waiting
+uint16_t ble_ring_count = 0;        // packets waiting
+uint16_t ble_ring_peak = 0;         // deepest backlog since the last [STATS]
+
 uint8_t  ble_tx_buf[BLE_MAX_PACKETS_PER_NOTIFY * PACKET_TOTAL_SIZE];
-uint16_t ble_tx_len = 0;            // bytes currently staged
+uint16_t ble_tx_len = 0;            // bytes in the batch being sent
+uint16_t ble_tx_off = 0;            // bytes of it the stack has accepted
+uint32_t ble_retry_at_us = 0;       // no notify before this, after a refusal
+bool     ble_retry_wait = false;
 uint16_t ble_notify_bytes = PACKET_TOTAL_SIZE;  // flush threshold, from the MTU
 uint16_t ble_chunk_max = PACKET_TOTAL_SIZE;     // max bytes per notification
 unsigned long ble_tx_first_ms = 0;  // when the oldest staged packet arrived
@@ -910,47 +984,112 @@ void ble_configure_batching(void) {
   if (ble_chunk_max > ble_notify_bytes) ble_chunk_max = ble_notify_bytes;
 }
 
-// Push whatever is staged. The buffer is emptied unconditionally: a batch the
-// link refused is discarded and counted rather than re-queued, which is what
-// keeps latency bounded on a congested connection.
-void ble_flush(void) {
-  if (ble_tx_len == 0) return;
-  if (!bleConnected || dataChar == NULL) {   // nobody to send to - drop it
-      ble_dropped_samples += ble_tx_len / PACKET_TOTAL_SIZE;
-      ble_tx_len = 0;
+// Move the next batch out of the ring once a full notification is waiting, or
+// the oldest packet has waited BLE_NOTIFY_FLUSH_MS, then offer it to the stack.
+// Only what the stack accepts is consumed, so a refusal costs time and no data.
+void ble_service(void) {
+  if (!bleConnected || dataChar == NULL) return;
+
+  if (ble_tx_len == 0) {
+      uint16_t batch = ble_notify_bytes / PACKET_TOTAL_SIZE;
+      if (ble_ring_count == 0) return;
+      if (ble_ring_count < batch && (millis() - ble_tx_first_ms) < BLE_NOTIFY_FLUSH_MS) return;
+      if (batch > ble_ring_count) batch = ble_ring_count;
+      for (uint16_t i = 0; i < batch; i++) {
+          memcpy(&ble_tx_buf[ble_tx_len], &ble_ring[(uint32_t)ble_ring_tail * PACKET_TOTAL_SIZE], PACKET_TOTAL_SIZE);
+          ble_tx_len += PACKET_TOTAL_SIZE;
+          ble_ring_tail = (ble_ring_tail + 1) % BLE_RING_PACKETS;
+      }
+      ble_ring_count -= batch;
+      ble_tx_off = 0;
+      ble_tx_first_ms = millis();
+  }
+
+  if (ble_retry_wait) {
+      if ((int32_t)(micros() - ble_retry_at_us) < 0) return;
+      ble_retry_wait = false;
+  }
+
+  uint16_t n = ble_tx_len - ble_tx_off;
+  if (n > ble_chunk_max) n = ble_chunk_max;
+
+  ble_notify_failed = false;
+  dataChar->setValue(&ble_tx_buf[ble_tx_off], n);
+  dataChar->notify();
+
+  if (ble_notify_failed) {
+      ble_notify_retries++;
+      ble_retry_at_us = micros() + BLE_RETRY_US;
+      ble_retry_wait = true;
       return;
   }
 
-  uint16_t staged = ble_tx_len;
-  ble_tx_len = 0;                             // clear first: notify() can re-enter
-
-  ble_notify_failed = false;
-  for (uint16_t off = 0; off < staged; off += ble_chunk_max) {
-      uint16_t n = staged - off;
-      if (n > ble_chunk_max) n = ble_chunk_max;
-      dataChar->setValue(&ble_tx_buf[off], n);
-      dataChar->notify();
-  }
-
-  uint16_t samples = staged / PACKET_TOTAL_SIZE;
-  if (ble_notify_failed) {
-      ble_dropped_samples += samples;
-      ble_dropped_notifies++;
-  } else {
-      ble_sent_samples += samples;
+  ble_tx_off += n;
+  if (ble_tx_off >= ble_tx_len) {
+      ble_sent_samples += ble_tx_len / PACKET_TOTAL_SIZE;
+      ble_tx_len = 0;
+      ble_tx_off = 0;
   }
 }
 
-// Stage one packet, flushing first if it would not fit.
+// Add one packet to the ring. When it is full the oldest packet is discarded,
+// so a link that never recovers still delivers fresh data with bounded latency.
 void ble_queue_packet(const byte *packet) {
-  if (ble_tx_len + PACKET_TOTAL_SIZE > sizeof(ble_tx_buf)) ble_flush();
-  if (ble_tx_len + PACKET_TOTAL_SIZE > sizeof(ble_tx_buf)) {
-      ble_dropped_samples++;                  // still no room - drop this sample
-      return;
+  if (ble_ring_count == BLE_RING_PACKETS) {
+      ble_ring_tail = (ble_ring_tail + 1) % BLE_RING_PACKETS;
+      ble_ring_count--;
+      ble_dropped_samples++;
   }
-  if (ble_tx_len == 0) ble_tx_first_ms = millis();
-  memcpy(&ble_tx_buf[ble_tx_len], packet, PACKET_TOTAL_SIZE);
-  ble_tx_len += PACKET_TOTAL_SIZE;
+  if (ble_ring_count == 0) ble_tx_first_ms = millis();
+  memcpy(&ble_ring[(uint32_t)ble_ring_head * PACKET_TOTAL_SIZE], packet, PACKET_TOTAL_SIZE);
+  ble_ring_head = (ble_ring_head + 1) % BLE_RING_PACKETS;
+  ble_ring_count++;
+  if (ble_ring_count > ble_ring_peak) ble_ring_peak = ble_ring_count;
+}
+
+static void ble_reset_tx(void) {
+  ble_ring_head = 0;
+  ble_ring_tail = 0;
+  ble_ring_count = 0;
+  ble_ring_peak = 0;
+  ble_tx_len = 0;
+  ble_tx_off = 0;
+  ble_retry_wait = false;
+}
+
+// Called once the host has finished setting up, so these requests do not
+// collide with its service discovery and MTU exchange.
+static void ble_request_fast_link(void) {
+  if (!ble_peer_known) return;
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  esp_ble_gap_set_preferred_phy(ble_peer_bda, 0, ESP_BLE_GAP_PHY_2M_PREF_MASK,
+                                ESP_BLE_GAP_PHY_2M_PREF_MASK, ESP_BLE_GAP_PHY_OPTIONS_NO_PREF);
+  esp_ble_gap_set_pkt_data_len(ble_peer_bda, 251);
+  esp_ble_gap_read_phy(ble_peer_bda);
+#elif defined(CONFIG_NIMBLE_ENABLED)
+  ble_gap_set_prefered_le_phy(ble_peer_handle, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
+  link_data_len_rc = ble_gap_set_data_len(ble_peer_handle, 251, 2120);
+#endif
+}
+
+// NimBLE reports these only through the library's own event handler, so they
+// are read back here instead. Bluedroid gets them from ble_gap_observer().
+static void ble_poll_link(void) {
+#if defined(CONFIG_NIMBLE_ENABLED)
+  if (!ble_peer_known) return;
+  struct ble_gap_conn_desc desc;
+  uint8_t tx_phy = 0, rx_phy = 0;
+  if (ble_gap_conn_find(ble_peer_handle, &desc) != 0) return;
+  ble_gap_read_le_phy(ble_peer_handle, &tx_phy, &rx_phy);
+  if (desc.conn_itvl != link_interval || tx_phy != link_tx_phy || rx_phy != link_rx_phy) {
+      link_interval = desc.conn_itvl;
+      link_latency  = desc.conn_latency;
+      link_timeout  = desc.supervision_timeout;
+      link_tx_phy   = tx_phy;
+      link_rx_phy   = rx_phy;
+      ble_link_changed = true;
+  }
+#endif
 }
 
 void start_acquisition(void) {
@@ -973,7 +1112,7 @@ void start_acquisition(void) {
 void stop_acquisition(void) {
   streaming_allowed = false;
   dataReady = false;
-  ble_tx_len = 0;                 // discard anything still staged
+  ble_reset_tx();                 // discard anything still staged
   ADS1299_SDATAC();
   digitalWrite(pin_START_NUM, LOW);
   digitalWrite(pin_LED_DEBUG, LOW);
@@ -1074,6 +1213,9 @@ void setup() {
 
   // --- BLE peripheral ---
   BLEDevice::init(BLE_DEVICE_NAME);
+#if defined(CONFIG_BLUEDROID_ENABLED)
+  BLEDevice::setCustomGapHandler(ble_gap_observer);
+#endif
   BLEDevice::setMTU(517);                   // ask for the largest ATT MTU we can use
   BLEDevice::setPower(ESP_PWR_LVL_P9);      // max TX power - keeps the link solid
 
@@ -1182,9 +1324,9 @@ void loop() {
   // MTU it negotiated, which sets how many packets go in one notification.
   if (bleConnected && hostRequestedStream && !streaming_allowed) {
       ble_configure_batching();
-      ble_tx_len = 0;
+      ble_reset_tx();             // never emit samples staged before this session
       ble_dropped_samples = 0;
-      ble_dropped_notifies = 0;
+      ble_notify_retries = 0;
       adc_overrun_count = 0;
       ble_sent_samples = 0;
       ble_stats_ms = millis();
@@ -1194,6 +1336,7 @@ void loop() {
       Serial.print(ble_notify_bytes / PACKET_TOTAL_SIZE);
       Serial.println(" packet(s) per notification");
       start_acquisition();
+      ble_request_fast_link();
   }
 
   // ============================================================
@@ -1353,12 +1496,8 @@ void loop() {
   // ============================================================
   // PART 4: Flush staged packets over BLE
   // ============================================================
-  // Send once a full notification's worth is staged, or once the oldest staged
-  // packet has been waiting BLE_NOTIFY_FLUSH_MS, whichever comes first.
-  if (ble_tx_len >= ble_notify_bytes ||
-      (ble_tx_len > 0 && (millis() - ble_tx_first_ms) >= BLE_NOTIFY_FLUSH_MS)) {
-      ble_flush();
-  }
+  // Runs every iteration: it decides when a batch is due, and paces its retries.
+  if (streaming_allowed) ble_service();
 
   // ============================================================
   // PART 5: Link statistics
@@ -1367,9 +1506,29 @@ void loop() {
       ble_stats_ms = millis();
       Serial.print("[STATS] sent="); Serial.print(ble_sent_samples);
       Serial.print(" ble_dropped="); Serial.print(ble_dropped_samples);
-      Serial.print(" (notifies="); Serial.print(ble_dropped_notifies);
+      Serial.print(" (retries="); Serial.print(ble_notify_retries);
       Serial.print(") adc_overrun="); Serial.print(adc_overrun_count);
-      Serial.print(" sd_dropped="); Serial.println(sd_dropped_count);
+      Serial.print(" sd_dropped="); Serial.print(sd_dropped_count);
+      Serial.print(" backlog="); Serial.print(ble_ring_count);
+      Serial.print(" peak="); Serial.print(ble_ring_peak);
+      Serial.print(" free_heap="); Serial.println(ESP.getFreeHeap());
+      ble_ring_peak = ble_ring_count;
+      ble_poll_link();
+  }
+
+  if (ble_link_changed) {
+      ble_link_changed = false;
+      Serial.print("[LINK] interval="); Serial.print(link_interval * 1.25f);
+      Serial.print("ms latency="); Serial.print(link_latency);
+      Serial.print(" timeout="); Serial.print(link_timeout * 10);
+      Serial.print("ms phy tx/rx="); Serial.print(link_tx_phy);
+      Serial.print("/"); Serial.print(link_rx_phy);
+#if defined(CONFIG_NIMBLE_ENABLED)
+      Serial.print(" data_len_request_rc="); Serial.println(link_data_len_rc);
+#else
+      Serial.print(" data_len tx/rx="); Serial.print(link_tx_octets);
+      Serial.print("/"); Serial.println(link_rx_octets);
+#endif
   }
 
   yield();
