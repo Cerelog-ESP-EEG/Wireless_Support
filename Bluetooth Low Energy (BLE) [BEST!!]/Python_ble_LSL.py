@@ -733,6 +733,12 @@ async def main():
         resync_bytes = 0
         lost_samples = 0        # gaps in the device's own sample clock
         last_device_ms = None
+        # Samples received per second of device time, over the current [STATS]
+        # window. Arrival rate is no use here: the firmware buffers through link
+        # stalls, so arrivals dip and then surge with nothing lost. On the device
+        # clock late samples still count, and only lost ones lower the figure.
+        window_samples = 0
+        window_device_ms = 0
         clock_offset = None     # local_clock() - device_ms/1000, set on first packet
         last_stats = time.time()
 
@@ -790,6 +796,9 @@ async def main():
                                 missing = int(round(delta_ms / (1000.0 * SAMPLE_PERIOD))) - 1
                                 if missing > 0:
                                     lost_samples += missing
+                                if delta_ms >= 0:
+                                    window_samples += 1
+                                    window_device_ms += delta_ms
                             last_device_ms = device_ms
 
                             ads_data = potential_packet[PACKET_IDX_DATA : fmt.idx_checksum]
@@ -840,13 +849,16 @@ async def main():
                 # --- Link quality report ---
                 now = time.time()
                 if now - last_stats >= STATS_PERIOD:
-                    elapsed = now - last_stats
                     last_stats = now
                     gui = f" | gui: {obci.status()}" if obci is not None else ""
-                    print(f"[STATS] {pushed} samples pushed | {pushed / max(elapsed, 1e-9):.0f} Hz recent "
+                    rate = (f"{1000.0 * window_samples / window_device_ms:.0f}"
+                            if window_device_ms > 0 else "--")
+                    print(f"[STATS] {pushed} samples pushed | {rate} Hz sample rate "
                           f"| lost={lost_samples} bad_checksum={bad_checksum} resync_bytes={resync_bytes} "
                           f"| notifications={link.notifications}{gui}")
                     pushed = 0
+                    window_samples = 0
+                    window_device_ms = 0
 
                 await asyncio.sleep(0)
 

@@ -451,8 +451,13 @@ The host script counts independently, using the 4-byte device timestamp in
 every packet to spot gaps:
 
 ```
-[STATS] 1250 samples pushed | 250 Hz recent | lost=0 bad_checksum=0 resync_bytes=0 | notifications=96
+[STATS] 1250 samples pushed | 250 Hz sample rate | lost=0 bad_checksum=0 resync_bytes=0 | notifications=96
 ```
+
+The Hz figure is samples received per second of device time, so it stays at 250
+when the link stalls and catches up, and drops below 250 only when samples are
+lost. `samples pushed` is how many packets arrived in the last 5 seconds, and that
+can swing above or below 1250 on a buffered board without any data being lost.
 
 Lost samples are **counted, never fabricated** — no zero-filling or
 value-holding, so nothing artificial reaches your recording. If `lost` climbs
@@ -514,7 +519,7 @@ USB serial output; the firmware prints its own counters every 5 s:
 ### `lost=` climbs steadily and the rate sags below 250 Hz
 
 ```
-[STATS] 1071 samples pushed | 214 Hz recent | lost=231 bad_checksum=0 resync_bytes=0
+[STATS] 1071 samples pushed | 214 Hz sample rate | lost=231 bad_checksum=0 resync_bytes=0
 ```
 
 `bad_checksum=0` with `resync_bytes=0` means nothing arrived corrupted — whole
