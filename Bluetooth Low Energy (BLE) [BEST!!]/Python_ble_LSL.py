@@ -731,7 +731,8 @@ async def main():
         pushed = 0
         bad_checksum = 0
         resync_bytes = 0
-        lost_samples = 0        # gaps in the device's own sample clock
+        lost_samples = 0        # gaps in the device's own sample clock, whole session
+        window_lost = 0         # the same, since the last [STATS] line
         last_device_ms = None
         # Samples received per second of device time, over the current [STATS]
         # window. Arrival rate is no use here: the firmware buffers through link
@@ -796,6 +797,7 @@ async def main():
                                 missing = int(round(delta_ms / (1000.0 * SAMPLE_PERIOD))) - 1
                                 if missing > 0:
                                     lost_samples += missing
+                                    window_lost += missing
                                 if delta_ms >= 0:
                                     window_samples += 1
                                     window_device_ms += delta_ms
@@ -854,11 +856,12 @@ async def main():
                     rate = (f"{1000.0 * window_samples / window_device_ms:.0f}"
                             if window_device_ms > 0 else "--")
                     print(f"[STATS] {pushed} samples pushed | {rate} Hz sample rate "
-                          f"| lost={lost_samples} bad_checksum={bad_checksum} resync_bytes={resync_bytes} "
+                          f"| lost={window_lost} bad_checksum={bad_checksum} resync_bytes={resync_bytes} "
                           f"| notifications={link.notifications}{gui}")
                     pushed = 0
                     window_samples = 0
                     window_device_ms = 0
+                    window_lost = 0
 
                 await asyncio.sleep(0)
 

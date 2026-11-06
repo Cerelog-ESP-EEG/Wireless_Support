@@ -458,11 +458,13 @@ The Hz figure is samples received per second of device time, so it stays at 250
 when the link stalls and catches up, and drops below 250 only when samples are
 lost. `samples pushed` is how many packets arrived in the last 5 seconds, and that
 can swing above or below 1250 on a buffered board without any data being lost.
+`lost` counts only the samples lost since the previous `[STATS]` line; the total
+for the whole session is printed when the script stops.
 
 Lost samples are **counted, never fabricated** — no zero-filling or
-value-holding, so nothing artificial reaches your recording. If `lost` climbs
-steadily, move closer to the device or cut 2.4 GHz interference; if it stays at
-0 you are getting exactly the same data the WiFi bridge would deliver.
+value-holding, so nothing artificial reaches your recording. If `lost` stays
+above 0, move closer to the device or cut 2.4 GHz interference; if it stays at 0
+you are getting exactly the same data the WiFi bridge would deliver.
 
 ## Timestamps
 
@@ -516,10 +518,10 @@ USB serial output; the firmware prints its own counters every 5 s:
 * `sent=0` with `adc_overrun=0` — the ADS1299 is not producing samples at all.
   That is an ADC/SPI problem, not a BLE one.
 
-### `lost=` climbs steadily and the rate sags below 250 Hz
+### `lost=` stays above 0 and the rate sags below 250 Hz
 
 ```
-[STATS] 1071 samples pushed | 214 Hz sample rate | lost=231 bad_checksum=0 resync_bytes=0
+[STATS] 1071 samples pushed | 214 Hz sample rate | lost=179 bad_checksum=0 resync_bytes=0
 ```
 
 `bad_checksum=0` with `resync_bytes=0` means nothing arrived corrupted — whole
