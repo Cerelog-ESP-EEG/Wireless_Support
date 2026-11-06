@@ -29,7 +29,8 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
 
 ## Instructions
 
-1. Flash `V2_Devices_BLE_hostfw` with the Arduino IDE, exactly the same way as
+1. Install the [Arduino IDE](https://www.arduino.cc/en/software) if you do not
+   have it, then flash `V2_Devices_BLE_hostfw` with it, exactly the same way as
    the WiFi firmware. No extra libraries are needed — the BLE library ships with
    the ESP32 Arduino core. (The build is *smaller* than the WiFi one: ~683 KB
    vs ~977 KB of flash, and ~18 KB less RAM.)
@@ -39,8 +40,8 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
    **'ESP32 WROOM DA Module'** - V1 is a different chip; the CH340 bridge on it
    is unreliable at the default upload speed, so also set
    **Tools > Upload Speed > 115200**. For the **16-channel** board flash
-   `BLE Firmware/16CH_Devices_BLE_hostfw`, which takes exactly the same settings
-   as V2 below (both are ESP32-S3). Note that these are *not* the settings the
+   `BLE Firmware/16CH_Devices_BLE_hostfw`, which takes the same settings
+   as V2 below (both are ESP32-S3), plus the three listed after them. Note that these are *not* the settings the
    16-channel **USB** firmware needs: `16CH_EMUL_FW` requires USB-OTG (TinyUSB)
    with CDC-on-boot disabled so the OpenBCI GUI sees a "VCP" port, and the BLE
    sketch deliberately does not - it has no serial port to impersonate. If you
@@ -54,6 +55,26 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
    | Board | **ESP32 Arduino > 'ESP32S3 Dev Module'** |
    | USB CDC On Boot | **Enabled** |
    | USB Mode | **Hardware CDC and JTAG** |
+
+   For the **16-channel** board, also match the build that was tested with the
+   buffered firmware:
+
+   | Setting | Value |
+   | --- | --- |
+   | ESP32 core | **esp32 by Espressif Systems 3.3.11** (Tools > Board > Boards Manager) |
+   | Flash Size | **8MB (64Mb)** |
+   | Partition Scheme | **8M with spiffs (3MB APP/1.5MB SPIFFS)** |
+
+   Boards Manager offers the newest core by default, so choose 3.3.11 from its
+   version list. Newer cores have not been tested with this firmware.
+
+   Older cores also compile this sketch, but core 3.2.0 uses a different BLE stack
+   (Bluedroid, not NimBLE) and that build has not been validated. Changing the core
+   in Boards Manager changes it for every sketch, including V1 and V2.
+
+   After flashing, power the board off completely, wait 10 seconds and power it back
+   on. Then run the script and confirm the stream reads 250 Hz before recording. If
+   it reads far more, see [far more than 250 samples per second](#16-channel-board-far-more-than-250-samples-per-second).
 
    Port: **Tools > Port**, select the port of your Cerelog board (it enumerates
    as a native USB device, so on macOS/Linux it is a `/dev/cu.usbmodem*`).
@@ -160,6 +181,32 @@ Staging is bounded at one full notification - 13 packets / 481 bytes on the
 8-channel boards, 8 packets / 488 bytes on the 16-channel one - and
 stopping the stream discards whatever is still staged, so a reconnect always
 starts clean rather than replaying stale samples.
+
+### 16-channel board: buffered instead of dropped
+
+Everything above describes V1 and V2. The 16-channel firmware holds on to refused
+samples, because a Bluetooth mouse on the same adapter as the board takes airtime
+from this link for as long as it is moving, and dropping cost about 28% of samples.
+
+* A refused notification is retried instead of discarded, and new samples wait in
+  a ring of `BLE_RING_PACKETS` (2048 packets, about 8 s, about 122 KB of RAM).
+* If the ring fills, the oldest sample is dropped and counted in `ble_dropped`, so
+  latency stays bounded at about 8 s.
+* Samples are stamped when they are read from the ADC, so a delayed sample still
+  gets the right LSL timestamp.
+* At the start of a stream the firmware asks for the 2M PHY and 251-byte link-layer
+  packets, which cut the airtime each notification needs. Both are requests the
+  host can refuse.
+
+Its serial output differs from the V1/V2 line shown above:
+
+```
+[STATS] sent=1246 ble_dropped=0 (retries=0) adc_overrun=0 sd_dropped=0 backlog=3 peak=7 free_heap=109356
+[LINK] interval=15.00ms latency=0 timeout=2000ms phy tx/rx=2/2 data_len_request_rc=0
+```
+
+`retries` counts refused notifications, `backlog` is the samples waiting now, and
+`peak` is the deepest backlog since the last `[STATS]` line.
 
 ## Native OpenBCI GUI connection (16-channel board only)
 
@@ -472,6 +519,15 @@ The most common offender is the **OpenBCI GUI running at the same time**. Quit
 it, confirm `lost=0`, then start it again and point it at the LSL stream. If the
 device's own `ble_dropped` and `adc_overrun` counters are both 0 while the host
 reports loss, the firmware is fine and the problem is on the computer.
+
+### 16-channel board: far more than 250 samples per second
+
+`[STATS]` shows a rate well above 250 Hz, device timestamps about 1 ms apart, and
+channels 9-16 reading raw zero on three samples out of four. ADC1 is converting
+too fast while ADC2 stays at 250 Hz. This has been seen with more than one
+firmware image, and reflashing does not clear it, because a flash never removes
+power from the ADCs. Power the board off completely, wait 10 seconds and power it
+back on, then check for 250 Hz before recording.
 
 ### Some channels read exactly 0.0, or sit at a constant value
 
