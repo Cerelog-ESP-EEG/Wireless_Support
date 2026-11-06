@@ -56,9 +56,11 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
    | USB CDC On Boot | **Enabled** |
    | USB Mode | **Hardware CDC and JTAG** |
 
-   For **V2**, the buffered firmware was tested on **esp32 by Espressif Systems
-   3.2.0** (Tools > Board > Boards Manager) with the default Flash Size and
-   Partition Scheme.
+   For **V2**, you **must** use **esp32 by Espressif Systems 3.3.11** (Tools > Board >
+   Boards Manager), with the default Flash Size and Partition Scheme. Boards Manager
+   offers the newest core by default, so choose 3.3.11 from its version list. Older
+   cores also compile this sketch, but a V2 built on core 3.2.0 still lost packets
+   while a Bluetooth mouse was in use; the same firmware built on 3.3.11 did not.
 
    For the **16-channel** board, also match the build that was tested with the
    buffered firmware:
@@ -74,7 +76,7 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
 
    Older cores also compile this sketch, but core 3.2.0 uses a different BLE stack
    (Bluedroid, not NimBLE) and that build has not been validated. Changing the core
-   in Boards Manager changes it for every sketch, including V1 and V2.
+   in Boards Manager changes it for every sketch, including V1.
 
    After flashing, power the board off completely, wait 10 seconds and power it back
    on. Then run the script and confirm the stream reads 250 Hz before recording. If
