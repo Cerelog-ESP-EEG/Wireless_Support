@@ -78,6 +78,10 @@ OpenBCI GUI can connect natively** alongside the LSL output — see
    (Bluedroid, not NimBLE) and that build has not been validated. Changing the core
    in Boards Manager changes it for every sketch, including V1.
 
+   > **Note:** on **V2** and **16-channel** boards, if you use another Bluetooth device
+   > with the same computer, such as a wireless mouse, and did not flash with core
+   > **3.3.11**, you will get packet loss.
+
    After flashing, power the board off completely, wait 10 seconds and power it back
    on. Then run the script and confirm the stream reads 250 Hz before recording. If
    it reads far more, see [far more than 250 samples per second](#16-channel-board-far-more-than-250-samples-per-second).
